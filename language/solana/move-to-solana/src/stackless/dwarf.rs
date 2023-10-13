@@ -13,6 +13,10 @@
 //! - Hides weirdly mutable array pointers.
 //! - Provides high-level instruction builders compatible with the stackless bytecode model.
 
+use crate::stackless::Module;
+
+use libc::{c_char, size_t};
+
 use llvm_sys::{
     core::*,
     debuginfo::{
@@ -27,8 +31,6 @@ use std::{
     ffi::{CStr, CString},
     ptr,
 };
-
-use crate::stackless::Module;
 
 pub use llvm_sys::{
     debuginfo::{LLVMCreateDIBuilder, LLVMDIBuilderCreateFile, LLVMDisposeDIBuilder},
@@ -66,6 +68,27 @@ fn string_to_c_params(s: String) -> (*const ::libc::c_char, ::libc::size_t) {
     };
     (cstr.as_ptr(), cstr.as_bytes().len())
 }
+
+fn with_c_str<Source, Res, F>(source: Source, f: F) -> Res
+where
+    Source: Into<Vec<u8, Global>>,
+    F: FnOnce(*const c_char) -> Res,
+{
+    let s = CString::from(source);
+    f(s.as_ptr())
+}
+
+fn with_c_str_len<Source, Res, F>(source: Source, f: F) -> Res
+where
+    Source: Into<Vec<u8, Global>>,
+    F: FnOnce(*const c_char, size_t) -> Res,
+{
+    let bytes = source.into();
+    let len = bytes.len();
+    let s = CString::from(bytes);
+    f(s.as_ptr(), len)
+}
+
 fn path_to_c_params(
     file_path: &str,
 ) -> (
@@ -114,11 +137,29 @@ impl DIBuilder {
 
             // create module
             let module_name = module_ref_name + ".dbg_info";
-            let (mod_nm_ptr, mut mod_nm_len) = str_to_c_params(&module_name);
-            dbg!(mod_nm_len);
-            let module_di = unsafe { LLVMModuleCreateWithName(mod_nm_ptr as *const ::libc::c_char) };
+
+            // Case 1, if you do not need to reuse the converted string:
+            {
+                let module_di =
+                    unsafe { LLVMModuleCreateWithName(CString::from(&module_name).as_ptr()) };
+            }
+
+            // Case 2, if you want to avoid the price of allocating a new string several times.
+            {
+                let c_module_name = CString::from(&module_name);
+                let module_di_1 = unsafe { LLVMModuleCreateWithName(c_module_name.as_ptr()) };
+                let module_di_2 = unsafe { LLVMModuleCreateWithName(c_module_name.as_ptr()) };
+            }
+
+            // Case 3, if you want to be fancy, and use a helper function.
+            {
+                let module_di = with_c_str(&module_name, |c_module_name| unsafe {
+                    LLVMModuleCreateWithName(c_module_name)
+                });
+            }
 
             // check dbg module name
+            let mut mod_nm_len = 0;
             let mod_nm_ptr = unsafe { LLVMGetModuleIdentifier(module_di, &mut mod_nm_len) };
             let module_di_name = from_raw_slice_to_string(mod_nm_ptr, mod_nm_len);
             dbg!(mod_nm_len);
@@ -129,8 +170,13 @@ impl DIBuilder {
             dbg!(source);
             let source = relative_to_absolute(source).expect("Must be the legal path");
             dbg!(&source);
-            let (src_ptr, src_len) = str_to_c_params(&source);
-            unsafe { LLVMSetSourceFileName(module_di, src_ptr, src_len) };
+
+            // Case 3 is applicable here as well:
+            {
+                with_c_str_len(&source, |source, len| unsafe {
+                    LLVMSetSourceFileName(module_di, source, len);
+                });
+            }
 
             // check the source name
             let mut src_len: ::libc::size_t = 0;
